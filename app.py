@@ -249,14 +249,28 @@ CITIES = [
     {"city": "Minneapolis",   "state": "MN", "lat": 44.9778,  "lon": -93.2650,  "zone": "control"},
 ]
 
+# All 32 preset training cities are US locations by construction — set this
+# explicitly rather than relying on a .get() default, since geocoded search
+# results carry an explicit is_us field and these should match that shape.
+for _c in CITIES:
+    _c["is_us"] = True
+    _c["country_code"] = "US"
+    _c["country_name"] = "United States"
+
 HAZARDS = [
-    {"key": "wildfire",          "label": "WILDFIRE",          "icon": "🔥", "color": "#F97316"},
-    {"key": "tornado",           "label": "TORNADO",           "icon": "🌪️", "color": "#8B5CF6"},
-    {"key": "hail",              "label": "HAIL",              "icon": "🧊", "color": "#22C55E"},
-    {"key": "thunderstorm_wind", "label": "THUNDERSTORM WIND", "icon": "⚡", "color": "#3B82F6"},
-    {"key": "flash_flood",       "label": "FLASH FLOOD",       "icon": "🌊", "color": "#06B6D4"},
-    {"key": "heat",              "label": "EXTREME HEAT",      "icon": "🌡️", "color": "#EF4444"},
-    {"key": "drought",           "label": "DROUGHT",           "icon": "☀️", "color": "#EAB308"},
+    # us_only=False: physically-grounded features (humidity/temp/wind) that
+    # transfer reasonably across climates, even though training data was US.
+    # us_only=True: trained exclusively on NOAA Storm Events / NOAA PDSI —
+    # both US-only government data sources with zero equivalent signal
+    # anywhere else in the world. These heads are extrapolating blind
+    # outside the US, not just "less confident."
+    {"key": "wildfire",          "label": "WILDFIRE",          "icon": "🔥", "color": "#F97316", "us_only": False},
+    {"key": "tornado",           "label": "TORNADO",           "icon": "🌪️", "color": "#8B5CF6", "us_only": True},
+    {"key": "hail",              "label": "HAIL",              "icon": "🧊", "color": "#22C55E", "us_only": True},
+    {"key": "thunderstorm_wind", "label": "THUNDERSTORM WIND", "icon": "⚡", "color": "#3B82F6", "us_only": True},
+    {"key": "flash_flood",       "label": "FLASH FLOOD",       "icon": "🌊", "color": "#06B6D4", "us_only": True},
+    {"key": "heat",              "label": "EXTREME HEAT",      "icon": "🌡️", "color": "#EF4444", "us_only": False},
+    {"key": "drought",           "label": "DROUGHT",           "icon": "☀️", "color": "#EAB308", "us_only": True},
 ]
 
 THREAT_LEVELS = [
@@ -413,21 +427,21 @@ def load_model_and_scaler():
 @st.cache_data(ttl=86400)
 def geocode_location(query):
     """
-    Converts a free-text location into a list of candidate US matches using
-    Open-Meteo's free geocoding API — no key required.
+    Converts a free-text location into a list of matching candidates ANYWHERE
+    in the world, using Open-Meteo's free geocoding API.
 
-    Returns a tuple: (us_candidates, had_non_us_results)
-      - us_candidates: list of parsed dicts, one per matching US location,
-        sorted by population descending (most populous first, since that's
-        usually — but not always — what someone means by a bare city name).
-        Ambiguous names (e.g. "Paris" -> Paris TX, Paris KY, Paris IL, Paris
-        ME) will return multiple entries here rather than silently guessing.
-      - had_non_us_results: True if the query matched something, just not
-        in the US — lets the caller give a more specific error message than
-        a generic "not found".
+    Ambiguous names (e.g. "Paris" -> Paris FR, Paris TX, Paris KY, Paris IL,
+    Paris ME...) return multiple entries sorted by population — largest
+    first, purely to make the list easier to scan, never auto-picked.
+    Disambiguation applies globally now, not just within the US, since
+    cross-country name collisions are exactly as real as domestic ones.
+
+    Non-US results are valid candidates. The app still runs full inference
+    on them — the per-hazard "not validated outside US" distinction is
+    handled at render time, not by blocking the search here.
     """
     if not query or not query.strip():
-        return [], False
+        return []
 
     url = "https://geocoding-api.open-meteo.com/v1/search"
     params = {"name": query.strip(), "count": 20, "language": "en", "format": "json"}
@@ -436,44 +450,58 @@ def geocode_location(query):
         r.raise_for_status()
         results = r.json().get("results", [])
     except Exception:
-        return [], False
+        return []
 
     if not results:
-        return [], False
-
-    us_raw = [res for res in results if res.get("country_code") == "US"]
-    had_non_us = len(us_raw) == 0 and len(results) > 0
+        return []
 
     candidates = []
-    for res in us_raw:
+    for res in results:
+        country_code = res.get("country_code", "")
+        country_name = res.get("country", country_code)
         admin1 = res.get("admin1", "")
         admin2 = res.get("admin2", "")  # county, when available — helps disambiguate
-        state_abbrev = US_STATE_ABBREV.get(admin1, "??")
         population = res.get("population")
+        is_us = country_code == "US"
 
-        label = f"{res.get('name', query)}, {state_abbrev}"
-        if admin2:
+        # "state" field: US 2-letter abbreviation for US results, or the
+        # region/province name for everywhere else — used both for display
+        # and (for US results) matching against the model's trained state
+        # dummy columns in feature engineering.
+        state_label = US_STATE_ABBREV.get(admin1, admin1 or "??") if is_us else (admin1 or country_name)
+
+        label = f"{res.get('name', query)}, {state_label}"
+        if is_us and admin2:
             label += f" ({admin2})"
+        elif not is_us:
+            label += f", {country_name}"
         if population:
             label += f" — pop. {population:,}"
 
+        display_name = f"{res.get('name', query)}, {state_label}"
+        if not is_us:
+            display_name += f", {country_name}"
+
         candidates.append({
             "city": res.get("name", query),
-            "state": state_abbrev,
+            "state": state_label,
+            "country_code": country_code,
+            "country_name": country_name,
             "lat": res.get("latitude"),
             "lon": res.get("longitude"),
-            "is_us": True,
+            "is_us": is_us,
             "zone": "custom",
-            "display_name": f"{res.get('name', query)}, {admin1}" if admin1 else res.get("name", query),
+            "display_name": display_name,
             "disambiguation_label": label,
             "population": population or 0,
         })
 
     candidates.sort(key=lambda c: c["population"], reverse=True)
-    return candidates, had_non_us
+    return candidates
 
 
 # ── DATA FETCHING ─────────────────────────────────────────────────────────────
+
 
 @st.cache_data(ttl=3600)
 def fetch_weather_lookback(lat, lon, days=21):
@@ -713,7 +741,7 @@ def render_composite(scores):
     return composite
 
 
-def render_hazard_card(h, score, wx_row):
+def render_hazard_card(h, score, wx_row, is_us=True):
     color = h["color"]
     lvl   = get_threat_level(score)
     is_high = score >= 65
@@ -721,6 +749,23 @@ def render_hazard_card(h, score, wx_row):
     shadow  = f"0 0 30px {color}12" if is_high else "none"
     top_bar = f"linear-gradient(90deg,transparent,{color}{'ff' if is_high else '40'},transparent)"
     pct     = score / 100
+
+    # Strong, hard-to-miss warning for the 5 hazards trained exclusively on
+    # US-only data (NOAA Storm Events, NOAA PDSI) when shown for a non-US
+    # location. The score is still displayed — just clearly flagged as
+    # extrapolating with zero real grounding, not merely "lower confidence."
+    show_unvalidated = h.get("us_only", False) and not is_us
+    warning_banner = ""
+    if show_unvalidated:
+        warning_banner = """
+        <div style="background:#78350f;border:1px solid #f59e0b;border-radius:6px;
+            padding:7px 10px;margin-bottom:10px;display:flex;align-items:flex-start;gap:6px">
+            <span style="font-size:13px;line-height:1.2">⚠️</span>
+            <span style="font-size:9px;color:#fbbf24;font-family:'Rajdhani',sans-serif;
+                font-weight:700;letter-spacing:0.3px;line-height:1.35">
+                NOT VALIDATED OUTSIDE US — trained exclusively on US storm/drought data
+            </span>
+        </div>"""
 
     # SVG gauge
     r = 34; circ = 2 * 3.14159 * r
@@ -831,6 +876,7 @@ def render_hazard_card(h, score, wx_row):
                 font-weight:700;letter-spacing:1.5px;padding:3px 9px;border-radius:3px;
                 background:{lvl['color']}18;border:1px solid {lvl['color']}35">{lvl['label']}</div>
         </div>
+        {warning_banner}
         <div style="display:flex;justify-content:center;margin-bottom:10px">{gauge_svg}</div>
         {factors_html}
     </div>
@@ -883,15 +929,12 @@ def main():
         st.markdown("**Search any US location**")
 
         with st.form("location_search"):
-            query = st.text_input("City, or city + state", placeholder="e.g. Austin, TX")
+            query = st.text_input("City or place, anywhere", placeholder="e.g. Austin, TX or Nairobi, Kenya")
             searched = st.form_submit_button("🔍 Search")
 
         if searched and query:
-            candidates, had_non_us = geocode_location(query)
-            if not candidates and had_non_us:
-                st.error("This model only covers US locations — try a US city.")
-                st.session_state.pending_candidates = None
-            elif not candidates:
+            candidates = geocode_location(query)
+            if not candidates:
                 st.error(f"No match found for '{query}'. Try a different spelling.")
                 st.session_state.pending_candidates = None
             elif len(candidates) == 1:
@@ -901,9 +944,9 @@ def main():
                 st.session_state.pending_candidates = None
                 st.success(f"Showing: {candidates[0]['display_name']}")
             else:
-                # Multiple places share this name (e.g. "Paris" -> Paris TX,
-                # Paris KY, Paris IL, Paris ME) — never silently guess which
-                # one the user meant. Hold the list and ask.
+                # Multiple places share this name (e.g. "Paris" -> Paris FR,
+                # Paris TX, Paris KY, Paris IL, Paris ME) — never silently
+                # guess which one the user meant. Hold the list and ask.
                 st.session_state.pending_candidates = candidates
 
         # ── Disambiguation picker — only shown when a search was ambiguous ──
@@ -948,11 +991,25 @@ def main():
     render_header(display_name, city_info["state"], utc_time)
 
     # ── Out-of-training-region notice ────────────────────────────────────
-    # The model trained on 32 cities across 15 states. A searched location
-    # outside that footprint is a legitimate use case (that's the whole point
-    # of free-text search) but predictions there are extrapolating beyond
-    # what the model has seen — worth being upfront about, not hiding it.
-    if city_info["state"] not in TRAINED_STATES:
+    # Three tiers, strongest to mildest:
+    #  1. Non-US: 5 of 7 hazards have zero training signal outside the US
+    #     (NOAA Storm Events + PDSI are US-only data sources). Say so plainly.
+    #  2. US but outside the 15 trained states: general extrapolation caveat,
+    #     same as before — all 7 heads still learned from US patterns.
+    #  3. US, trained state, just not one of the 32 training cities: mild note.
+    if not city_info.get("is_us", False):
+        st.warning(
+            f"🌍 **{display_name}** is outside the United States. StormSentinel trained "
+            f"exclusively on US weather and hazard data. **Wildfire** and **Extreme Heat** "
+            f"use physically-grounded features (humidity, wind, temperature) that transfer "
+            f"reasonably across climates — those two are shown normally. But **Tornado, "
+            f"Hail, Thunderstorm Wind, Flash Flood, and Drought** were trained only on "
+            f"NOAA's US-only databases and have **no real grounding for this location** — "
+            f"those 5 cards are flagged individually below. Treat them as a demonstration "
+            f"of the model architecture, not a real risk assessment.",
+            icon="🌍",
+        )
+    elif city_info["state"] not in TRAINED_STATES:
         st.warning(
             f"📍 **{display_name}, {city_info['state']}** is outside StormSentinel's core "
             f"training region (15 states across the wildfire, tornado-alley, and heat-corridor "
@@ -1002,12 +1059,12 @@ def main():
     cols1 = st.columns(4)
     for col, h in zip(cols1, row1):
         with col:
-            render_hazard_card(h, scores[h["key"]], wx_row)
+            render_hazard_card(h, scores[h["key"]], wx_row, is_us=city_info.get("is_us", False))
 
     cols2 = st.columns(3)
     for col, h in zip(cols2, row2):
         with col:
-            render_hazard_card(h, scores[h["key"]], wx_row)
+            render_hazard_card(h, scores[h["key"]], wx_row, is_us=city_info.get("is_us", False))
 
     # ── Surface conditions ────────────────────────────────────────────────
     render_wx_strip(wx_row)
