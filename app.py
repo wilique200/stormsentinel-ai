@@ -253,6 +253,30 @@ STATE_CODES = {
     "026": "NV", "034": "OK", "035": "OR", "041": "TX", "045": "WA",
 }
 
+# Full US state name -> abbreviation. Needed because a user-searched location
+# can be anywhere in the US, not just the 15 states the model trained on —
+# geocoding returns full state names, and we need abbreviations to check
+# against the model's trained state dummy columns.
+US_STATE_ABBREV = {
+    "Alabama": "AL", "Alaska": "AK", "Arizona": "AZ", "Arkansas": "AR",
+    "California": "CA", "Colorado": "CO", "Connecticut": "CT", "Delaware": "DE",
+    "Florida": "FL", "Georgia": "GA", "Hawaii": "HI", "Idaho": "ID",
+    "Illinois": "IL", "Indiana": "IN", "Iowa": "IA", "Kansas": "KS",
+    "Kentucky": "KY", "Louisiana": "LA", "Maine": "ME", "Maryland": "MD",
+    "Massachusetts": "MA", "Michigan": "MI", "Minnesota": "MN", "Mississippi": "MS",
+    "Missouri": "MO", "Montana": "MT", "Nebraska": "NE", "Nevada": "NV",
+    "New Hampshire": "NH", "New Jersey": "NJ", "New Mexico": "NM", "New York": "NY",
+    "North Carolina": "NC", "North Dakota": "ND", "Ohio": "OH", "Oklahoma": "OK",
+    "Oregon": "OR", "Pennsylvania": "PA", "Rhode Island": "RI", "South Carolina": "SC",
+    "South Dakota": "SD", "Tennessee": "TN", "Texas": "TX", "Utah": "UT",
+    "Vermont": "VT", "Virginia": "VA", "Washington": "WA", "West Virginia": "WV",
+    "Wisconsin": "WI", "Wyoming": "WY", "District of Columbia": "DC",
+}
+
+# States the model actually trained on — used to warn users searching
+# outside this footprint that predictions are extrapolating
+TRAINED_STATES = set(STATE_CODES.values())
+
 DAILY_VARS = [
     "temperature_2m_max", "temperature_2m_min", "temperature_2m_mean",
     "apparent_temperature_max", "apparent_temperature_mean",
@@ -361,6 +385,48 @@ def load_model_and_scaler():
     model.load_state_dict(torch.load("stormsentinel_model.pt", map_location="cpu"))
     model.eval()
     return model, scaler, meta
+
+
+# ── GEOCODING ─────────────────────────────────────────────────────────────────
+
+@st.cache_data(ttl=86400)
+def geocode_location(query):
+    """
+    Converts a free-text location (city name, city+state, zip-adjacent search)
+    into lat/lon/state using Open-Meteo's free geocoding API — no key required.
+    Returns None if nothing matched or the result isn't in the US.
+    """
+    if not query or not query.strip():
+        return None
+    url = "https://geocoding-api.open-meteo.com/v1/search"
+    params = {"name": query.strip(), "count": 5, "language": "en", "format": "json"}
+    try:
+        r = requests.get(url, params=params, timeout=15)
+        r.raise_for_status()
+        results = r.json().get("results", [])
+    except Exception:
+        return None
+
+    if not results:
+        return None
+
+    # Prefer US results — this model is US-hazard-specific
+    us_results = [res for res in results if res.get("country_code") == "US"]
+    candidates = us_results if us_results else results
+    top = candidates[0]
+
+    admin1 = top.get("admin1", "")
+    state_abbrev = US_STATE_ABBREV.get(admin1)
+
+    return {
+        "city": top.get("name", query),
+        "state": state_abbrev or "??",
+        "lat": top.get("latitude"),
+        "lon": top.get("longitude"),
+        "is_us": top.get("country_code") == "US",
+        "zone": "custom",
+        "display_name": f"{top.get('name', query)}, {admin1}" if admin1 else top.get("name", query),
+    }
 
 
 # ── DATA FETCHING ─────────────────────────────────────────────────────────────
@@ -762,17 +828,40 @@ def main():
                  f"feature_scaler.pkl, and feature_columns.json are in the same directory.")
         st.stop()
 
+    if "city_info" not in st.session_state:
+        st.session_state.city_info = next(c for c in CITIES if c["city"] == "Phoenix")
+
     # ── Sidebar controls ───────────────────────────────────────────────────
     with st.sidebar:
         st.markdown("### ⚡ StormSentinel AI")
+        st.markdown("**Search any US location**")
+
+        with st.form("location_search"):
+            query = st.text_input("City, or city + state", placeholder="e.g. Austin, TX")
+            searched = st.form_submit_button("🔍 Search")
+
+        if searched and query:
+            result = geocode_location(query)
+            if result is None:
+                st.error(f"No match found for '{query}'. Try a different spelling or add a state.")
+            elif not result["is_us"]:
+                st.error("This model only covers US locations — try a US city.")
+            else:
+                st.session_state.city_info = result
+                st.success(f"Showing: {result['display_name']}")
+
+        st.markdown("---")
+        st.markdown("**Or quick-select a trained city:**")
         city_names = [c["city"] for c in CITIES]
-        selected_name = st.selectbox("Select City", city_names, index=19)  # Phoenix default
-        city_info = next(c for c in CITIES if c["city"] == selected_name)
-        auto_refresh = st.checkbox("Auto-refresh (60 min)", value=False)
-        manual_refresh = st.button("🔄 Refresh Now")
+        selected_name = st.selectbox("Quick select", city_names, index=19, label_visibility="collapsed")
+        if st.button("Use this city"):
+            st.session_state.city_info = next(c for c in CITIES if c["city"] == selected_name)
+
+        city_info = st.session_state.city_info
+
         st.markdown("---")
         st.markdown(f"""
-        **Zone:** `{city_info['zone'].upper()}`  
+        **Zone:** `{city_info.get('zone', 'custom').upper()}`  
         **State:** `{city_info['state']}`  
         **Coordinates:** `{city_info['lat']:.2f}°N, {city_info['lon']:.2f}°W`
         """)
@@ -782,9 +871,33 @@ def main():
                    "Drought: NOAA PDSI climdiv  \n"
                    "Labels: NOAA Storm Events + NASA FIRMS")
 
+    display_name = city_info.get("city", "Unknown")
+
     # ── Header ────────────────────────────────────────────────────────────
     utc_time = datetime.utcnow().strftime("%H:%M:%S")
-    render_header(city_info["city"], city_info["state"], utc_time)
+    render_header(display_name, city_info["state"], utc_time)
+
+    # ── Out-of-training-region notice ────────────────────────────────────
+    # The model trained on 32 cities across 15 states. A searched location
+    # outside that footprint is a legitimate use case (that's the whole point
+    # of free-text search) but predictions there are extrapolating beyond
+    # what the model has seen — worth being upfront about, not hiding it.
+    if city_info["state"] not in TRAINED_STATES:
+        st.warning(
+            f"📍 **{display_name}, {city_info['state']}** is outside StormSentinel's core "
+            f"training region (15 states across the wildfire, tornado-alley, and heat-corridor "
+            f"zones). The model can still generate a prediction from live weather data, but "
+            f"treat these numbers as **lower-confidence extrapolation** rather than a "
+            f"validated forecast for this specific area.",
+            icon="⚠️",
+        )
+    elif city_info.get("zone") == "custom":
+        st.info(
+            f"📍 Showing a searched location within StormSentinel's trained region "
+            f"({city_info['state']}), but not one of the 32 cities used in training. "
+            f"Predictions use the same model and live weather data as the trained cities.",
+            icon="ℹ️",
+        )
 
     # ── Load data ─────────────────────────────────────────────────────────
     with st.spinner("Fetching weather data and running inference..."):
