@@ -1,7 +1,7 @@
 streamlit
- torch
- joblib
- plotly
- requests
+torch
+joblib
+plotly
+requests
 folium
 streamlit-folium
