@@ -26,6 +26,27 @@ import io
 import time
 from datetime import datetime, timedelta
 
+
+def st_html(html_string):
+    """
+    Renders an HTML string via st.markdown, safely.
+
+    Streamlit's st.markdown() runs content through a Markdown parser before
+    display. Markdown treats any line starting with 4+ spaces of indentation
+    as a preformatted code block — which means multi-line HTML f-strings
+    written with normal Python indentation (for readability) get partially
+    rendered as literal escaped text instead of parsed HTML. Stripping each
+    line's leading whitespace before rendering avoids that entirely, since
+    HTML/CSS don't care about leading whitespace anyway.
+
+    Defined here, immediately after imports, because the global CSS block
+    below calls it before any other function definitions would normally
+    appear — Python executes top-to-bottom, so this must exist first.
+    """
+    cleaned = "\n".join(line.lstrip() for line in html_string.split("\n"))
+    st.markdown(cleaned, unsafe_allow_html=True)
+
+
 # ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
     page_title="StormSentinel AI",
@@ -594,24 +615,6 @@ def run_inference(feature_row, model, scaler, meta):
 
 
 # ── UI RENDERING ──────────────────────────────────────────────────────────────
-
-# ── HTML RENDERING HELPER ─────────────────────────────────────────────────────
-
-def st_html(html_string):
-    """
-    Renders an HTML string via st.markdown, safely.
-
-    Streamlit's st.markdown() runs content through a Markdown parser before
-    display. Markdown treats any line starting with 4+ spaces of indentation
-    as a preformatted code block — which means multi-line HTML f-strings
-    written with normal Python indentation (for readability) get partially
-    rendered as literal escaped text instead of parsed HTML. Stripping each
-    line's leading whitespace before rendering avoids that entirely, since
-    HTML/CSS don't care about leading whitespace anyway.
-    """
-    cleaned = "\n".join(line.lstrip() for line in html_string.split("\n"))
-    st.markdown(cleaned, unsafe_allow_html=True)
-
 
 def render_header(city_name, state, utc_time):
     st_html(f"""
