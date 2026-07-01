@@ -35,7 +35,7 @@ st.set_page_config(
 )
 
 # ── Global CSS ────────────────────────────────────────────────────────────────
-st.markdown("""
+st_html("""
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Rajdhani:wght@400;600;700&family=Space+Mono:wght@400;700&family=Inter:wght@400;500&display=swap');
 
@@ -189,7 +189,7 @@ html, body, [class*="css"] {
     margin-top: 20px;
 }
 </style>
-""", unsafe_allow_html=True)
+""")
 
 
 # ── CONSTANTS ─────────────────────────────────────────────────────────────────
@@ -595,8 +595,26 @@ def run_inference(feature_row, model, scaler, meta):
 
 # ── UI RENDERING ──────────────────────────────────────────────────────────────
 
+# ── HTML RENDERING HELPER ─────────────────────────────────────────────────────
+
+def st_html(html_string):
+    """
+    Renders an HTML string via st.markdown, safely.
+
+    Streamlit's st.markdown() runs content through a Markdown parser before
+    display. Markdown treats any line starting with 4+ spaces of indentation
+    as a preformatted code block — which means multi-line HTML f-strings
+    written with normal Python indentation (for readability) get partially
+    rendered as literal escaped text instead of parsed HTML. Stripping each
+    line's leading whitespace before rendering avoids that entirely, since
+    HTML/CSS don't care about leading whitespace anyway.
+    """
+    cleaned = "\n".join(line.lstrip() for line in html_string.split("\n"))
+    st.markdown(cleaned, unsafe_allow_html=True)
+
+
 def render_header(city_name, state, utc_time):
-    st.markdown(f"""
+    st_html(f"""
     <div class="ss-header">
         <div style="display:flex;align-items:center;gap:12px">
             <div style="width:36px;height:36px;border-radius:8px;
@@ -615,7 +633,7 @@ def render_header(city_name, state, utc_time):
             <span class="ss-live-dot">●</span> {utc_time} UTC
         </div>
     </div>
-    """, unsafe_allow_html=True)
+    """)
 
 
 def render_composite(scores):
@@ -640,7 +658,7 @@ def render_composite(scores):
             font-weight:{'700' if active else '400'};
             color:{''+t['color'] if active else '#1e2d40'}">{t['label']}</span>"""
 
-    st.markdown(f"""
+    st_html(f"""
     <div class="threat-block">
         <div style="display:flex;align-items:center;gap:32px;flex-wrap:wrap">
             <div>
@@ -665,7 +683,7 @@ def render_composite(scores):
             </div>
         </div>
     </div>
-    """, unsafe_allow_html=True)
+    """)
     return composite
 
 
@@ -773,7 +791,7 @@ def render_hazard_card(h, score, wx_row):
                 color:{hi_val};font-weight:{'700' if fhi else '400'}">{fv}</span>
         </div>"""
 
-    st.markdown(f"""
+    st_html(f"""
     <div class="hazard-card" style="border:{border};box-shadow:{shadow}">
         <div style="position:absolute;top:0;left:0;right:0;height:2px;
             background:{top_bar}"></div>
@@ -790,7 +808,7 @@ def render_hazard_card(h, score, wx_row):
         <div style="display:flex;justify-content:center;margin-bottom:10px">{gauge_svg}</div>
         {factors_html}
     </div>
-    """, unsafe_allow_html=True)
+    """)
 
 
 def render_wx_strip(wx_row):
@@ -809,13 +827,13 @@ def render_wx_strip(wx_row):
             <span class="wx-item-value">{val}</span>
         </div>""" for lbl, val in items)
 
-    st.markdown(f"""
+    st_html(f"""
     <div class="wx-strip">
         <span style="font-size:8px;color:#2e4156;font-family:'Rajdhani',sans-serif;
             letter-spacing:2.5px;white-space:nowrap">SURFACE CONDITIONS</span>
         {items_html}
     </div>
-    """, unsafe_allow_html=True)
+    """)
 
 
 # ── MAIN APP ──────────────────────────────────────────────────────────────────
@@ -860,7 +878,7 @@ def main():
         city_info = st.session_state.city_info
 
         st.markdown("---")
-        st.markdown(f"""
+        st_html(f"""
         **Zone:** `{city_info.get('zone', 'custom').upper()}`  
         **State:** `{city_info['state']}`  
         **Coordinates:** `{city_info['lat']:.2f}°N, {city_info['lon']:.2f}°W`
@@ -946,7 +964,7 @@ def main():
     st.markdown("""<div class="ss-footer">
         STORMSENTINELNET · 7-HEAD MULTI-TASK NEURAL NETWORK ·
         OPEN-METEO · NASA FIRMS · NOAA STORM EVENTS · NOAA PDSI
-    </div>""", unsafe_allow_html=True)
+    </div>""")
 
 
 if __name__ == "__main__":
