@@ -413,41 +413,64 @@ def load_model_and_scaler():
 @st.cache_data(ttl=86400)
 def geocode_location(query):
     """
-    Converts a free-text location (city name, city+state, zip-adjacent search)
-    into lat/lon/state using Open-Meteo's free geocoding API — no key required.
-    Returns None if nothing matched or the result isn't in the US.
+    Converts a free-text location into a list of candidate US matches using
+    Open-Meteo's free geocoding API — no key required.
+
+    Returns a tuple: (us_candidates, had_non_us_results)
+      - us_candidates: list of parsed dicts, one per matching US location,
+        sorted by population descending (most populous first, since that's
+        usually — but not always — what someone means by a bare city name).
+        Ambiguous names (e.g. "Paris" -> Paris TX, Paris KY, Paris IL, Paris
+        ME) will return multiple entries here rather than silently guessing.
+      - had_non_us_results: True if the query matched something, just not
+        in the US — lets the caller give a more specific error message than
+        a generic "not found".
     """
     if not query or not query.strip():
-        return None
+        return [], False
+
     url = "https://geocoding-api.open-meteo.com/v1/search"
-    params = {"name": query.strip(), "count": 5, "language": "en", "format": "json"}
+    params = {"name": query.strip(), "count": 20, "language": "en", "format": "json"}
     try:
         r = requests.get(url, params=params, timeout=15)
         r.raise_for_status()
         results = r.json().get("results", [])
     except Exception:
-        return None
+        return [], False
 
     if not results:
-        return None
+        return [], False
 
-    # Prefer US results — this model is US-hazard-specific
-    us_results = [res for res in results if res.get("country_code") == "US"]
-    candidates = us_results if us_results else results
-    top = candidates[0]
+    us_raw = [res for res in results if res.get("country_code") == "US"]
+    had_non_us = len(us_raw) == 0 and len(results) > 0
 
-    admin1 = top.get("admin1", "")
-    state_abbrev = US_STATE_ABBREV.get(admin1)
+    candidates = []
+    for res in us_raw:
+        admin1 = res.get("admin1", "")
+        admin2 = res.get("admin2", "")  # county, when available — helps disambiguate
+        state_abbrev = US_STATE_ABBREV.get(admin1, "??")
+        population = res.get("population")
 
-    return {
-        "city": top.get("name", query),
-        "state": state_abbrev or "??",
-        "lat": top.get("latitude"),
-        "lon": top.get("longitude"),
-        "is_us": top.get("country_code") == "US",
-        "zone": "custom",
-        "display_name": f"{top.get('name', query)}, {admin1}" if admin1 else top.get("name", query),
-    }
+        label = f"{res.get('name', query)}, {state_abbrev}"
+        if admin2:
+            label += f" ({admin2})"
+        if population:
+            label += f" — pop. {population:,}"
+
+        candidates.append({
+            "city": res.get("name", query),
+            "state": state_abbrev,
+            "lat": res.get("latitude"),
+            "lon": res.get("longitude"),
+            "is_us": True,
+            "zone": "custom",
+            "display_name": f"{res.get('name', query)}, {admin1}" if admin1 else res.get("name", query),
+            "disambiguation_label": label,
+            "population": population or 0,
+        })
+
+    candidates.sort(key=lambda c: c["population"], reverse=True)
+    return candidates, had_non_us
 
 
 # ── DATA FETCHING ─────────────────────────────────────────────────────────────
@@ -851,6 +874,8 @@ def main():
 
     if "city_info" not in st.session_state:
         st.session_state.city_info = next(c for c in CITIES if c["city"] == "Phoenix")
+    if "pending_candidates" not in st.session_state:
+        st.session_state.pending_candidates = None
 
     # ── Sidebar controls ───────────────────────────────────────────────────
     with st.sidebar:
@@ -862,14 +887,37 @@ def main():
             searched = st.form_submit_button("🔍 Search")
 
         if searched and query:
-            result = geocode_location(query)
-            if result is None:
-                st.error(f"No match found for '{query}'. Try a different spelling or add a state.")
-            elif not result["is_us"]:
+            candidates, had_non_us = geocode_location(query)
+            if not candidates and had_non_us:
                 st.error("This model only covers US locations — try a US city.")
+                st.session_state.pending_candidates = None
+            elif not candidates:
+                st.error(f"No match found for '{query}'. Try a different spelling.")
+                st.session_state.pending_candidates = None
+            elif len(candidates) == 1:
+                # Unambiguous — proceed immediately, no need to make the user
+                # confirm a single obvious match
+                st.session_state.city_info = candidates[0]
+                st.session_state.pending_candidates = None
+                st.success(f"Showing: {candidates[0]['display_name']}")
             else:
-                st.session_state.city_info = result
-                st.success(f"Showing: {result['display_name']}")
+                # Multiple places share this name (e.g. "Paris" -> Paris TX,
+                # Paris KY, Paris IL, Paris ME) — never silently guess which
+                # one the user meant. Hold the list and ask.
+                st.session_state.pending_candidates = candidates
+
+        # ── Disambiguation picker — only shown when a search was ambiguous ──
+        if st.session_state.pending_candidates:
+            n = len(st.session_state.pending_candidates)
+            st.warning(f"Found {n} US places matching that name — which one did you mean?", icon="📍")
+            options = [c["disambiguation_label"] for c in st.session_state.pending_candidates]
+            picked_label = st.radio("Select the correct location:", options, index=0, label_visibility="collapsed")
+            if st.button("✅ Confirm location"):
+                picked = next(c for c in st.session_state.pending_candidates
+                              if c["disambiguation_label"] == picked_label)
+                st.session_state.city_info = picked
+                st.session_state.pending_candidates = None
+                st.rerun()
 
         st.markdown("---")
         st.markdown("**Or quick-select a trained city:**")
@@ -877,6 +925,7 @@ def main():
         selected_name = st.selectbox("Quick select", city_names, index=19, label_visibility="collapsed")
         if st.button("Use this city"):
             st.session_state.city_info = next(c for c in CITIES if c["city"] == selected_name)
+            st.session_state.pending_candidates = None
 
         city_info = st.session_state.city_info
 
