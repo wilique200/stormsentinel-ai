@@ -339,6 +339,58 @@ BEST_THRESHOLDS = {
     "drought":           0.75,
 }
 
+# Tiered safety guidance per hazard, shown only at MODERATE severity or
+# above — below that there's nothing actionable worth surfacing. Content
+# follows standard public safety guidance patterns (NWS, CDC, Ready.gov)
+# rather than anything hazard-model-specific; these are the same practical
+# steps official sources recommend at each severity level.
+RECOMMENDATIONS = {
+    "wildfire": {
+        "moderate": ["Monitor local air quality and fire updates", "Know your evacuation routes in advance"],
+        "elevated": ["Avoid any outdoor burning", "Keep vehicles fueled with a go-bag packed", "Watch for local evacuation notices"],
+        "high":     ["Prepare to evacuate on short notice", "Clear dry vegetation near structures", "Keep N95 masks on hand for smoke exposure"],
+        "extreme":  ["Follow local evacuation orders immediately", "Avoid the area if at all possible", "Keep windows closed; use air purifiers indoors"],
+    },
+    "tornado": {
+        "moderate": ["Review your household's tornado safety plan", "Keep a charged weather radio or phone alerts on"],
+        "elevated": ["Stay alert to weather alerts through the day", "Identify your safe room — interior, lowest floor, no windows"],
+        "high":     ["Postpone outdoor plans", "Keep shoes and a flashlight near your safe room"],
+        "extreme":  ["Take shelter immediately if a warning is issued", "Stay away from windows and mobile homes"],
+    },
+    "hail": {
+        "moderate": ["Move vehicles under cover if possible"],
+        "elevated": ["Park vehicles in a garage or covered area", "Secure outdoor furniture and equipment"],
+        "high":     ["Stay indoors, away from windows and skylights", "Avoid driving until the storm passes"],
+        "extreme":  ["Take shelter immediately", "Do not go outside until conditions clear"],
+    },
+    "thunderstorm_wind": {
+        "moderate": ["Secure loose outdoor items"],
+        "elevated": ["Bring in patio furniture and anything that could become a projectile"],
+        "high":     ["Avoid parking under trees or power lines", "Stay indoors"],
+        "extreme":  ["Stay away from windows", "Be prepared for possible power outages"],
+    },
+    "flash_flood": {
+        "moderate": ["Avoid low-lying areas after heavy rain"],
+        "elevated": ["Know your route to higher ground", "Avoid spending time in basements during heavy rain"],
+        "high":     ["Never drive through flooded roads — turn around, don't drown", "Move valuables to higher ground"],
+        "extreme":  ["Evacuate low-lying areas immediately if instructed", "Never walk or drive through moving floodwater"],
+    },
+    "heat": {
+        "moderate": ["Stay hydrated", "Limit strenuous outdoor activity during peak afternoon hours"],
+        "elevated": ["Check on elderly neighbors and relatives", "Never leave children or pets in parked vehicles"],
+        "high":     ["Limit outdoor exposure between 11am–4pm", "Seek air-conditioned spaces when possible", "Wear light, breathable clothing"],
+        "extreme":  ["Avoid outdoor activity entirely if possible", "Watch for signs of heat exhaustion or heat stroke (confusion, rapid pulse, hot dry skin) and seek medical help immediately if they occur"],
+    },
+    "drought": {
+        "moderate": ["Be mindful of water usage", "Check for local watering restrictions"],
+        "elevated": ["Reduce non-essential water use — lawn watering, car washing", "Watch for local water advisories"],
+        "high":     ["Follow local water conservation mandates", "Be alert to elevated wildfire risk, which often accompanies drought"],
+        "extreme":  ["Comply with any mandatory water restrictions", "Monitor local emergency advisories closely"],
+    },
+}
+
+_LEVEL_TO_TIER = {"MODERATE": "moderate", "ELEVATED": "elevated", "HIGH": "high", "EXTREME": "extreme"}
+
 
 # ── HELPER FUNCTIONS ──────────────────────────────────────────────────────────
 
@@ -504,11 +556,19 @@ def geocode_location(query):
 
 
 @st.cache_data(ttl=3600)
-def fetch_weather_lookback(lat, lon, days=21):
+def fetch_weather_lookback(lat, lon, days=395):
     """
-    Fetches the past 21 days of daily weather from Open-Meteo archive API.
-    21 days ensures we have enough history for the 14-day rolling features
-    used in training — using the same variables and endpoint as the pipeline.
+    Fetches roughly 13 months of daily weather from Open-Meteo archive API.
+
+    Extended from a 21-day window (Jul 2026) after live testing during an
+    active heat wave revealed a self-referential baseline bug: with only 21
+    days of history, an extended heat wave dominates its own comparison
+    window, making temp_anomaly collapse toward zero exactly when it should
+    spike. ~13 months lets engineer_features() compare today against the
+    same calendar month from roughly a year ago — a genuine seasonal
+    baseline that isn't contaminated by the current event. Short rolling
+    features (heat_streak, humidity_7d_avg, etc.) still correctly use only
+    the trailing ~21 days of this larger dataframe.
     """
     end_date   = datetime.utcnow().date()
     start_date = end_date - timedelta(days=days)
@@ -615,9 +675,33 @@ def engineer_features(wx_df, pdsi_val, city_info, meta):
     is_hot = df["apparent_temperature_max"] >= 35
     df["heat_streak"] = is_hot.groupby((~is_hot).cumsum()).cumsum()
 
-    # Temperature anomaly (vs this city-month's training baseline)
-    # At inference time we approximate using the current-window mean
-    df["temp_anomaly"] = df["temperature_2m_max"] - df["temperature_2m_max"].mean()
+    # Temperature anomaly (vs this city-month's climatological baseline)
+    #
+    # BUG FIX (Jul 2026): previously computed as today's temp minus the mean
+    # of the same short window being analyzed — during an extended heat
+    # wave, that self-referential baseline gets dragged up by the very
+    # event we're trying to detect, so the anomaly collapses toward zero
+    # exactly when it should spike. Confirmed via live testing: Chicago and
+    # Dallas both showed near-zero heat scores during a verified, ongoing
+    # heat wave (apparent temps ~38°C, heat streaks of 3-12 days).
+    #
+    # Fix: use days from the SAME calendar month, excluding the most recent
+    # 21 days (the active event window), as the baseline instead. With the
+    # ~13-month fetch, this mostly draws from ~last year's same month — a
+    # genuine seasonal normal uncontaminated by whatever is happening right
+    # now. Falls back to the old (imperfect) method only if there isn't
+    # enough historical same-month data to compute a reliable baseline —
+    # e.g., a location with very limited archive history available.
+    current_month = df["time"].dt.month.iloc[-1]
+    cutoff_date = df["time"].max() - pd.Timedelta(days=21)
+    baseline_pool = df[(df["time"].dt.month == current_month) & (df["time"] < cutoff_date)]
+
+    if len(baseline_pool) >= 5:
+        baseline_temp = baseline_pool["temperature_2m_max"].mean()
+    else:
+        baseline_temp = df["temperature_2m_max"].mean()  # fallback: sparse history
+
+    df["temp_anomaly"] = df["temperature_2m_max"] - baseline_temp
 
     # ── PDSI (current + lagged) ───────────────────────────────────────────
     df["pdsi"] = pdsi_val
@@ -883,6 +967,68 @@ def render_hazard_card(h, score, wx_row, is_us=True):
     """)
 
 
+def render_recommendations(scores, is_us):
+    """
+    Shows actionable safety guidance for any hazard at MODERATE severity or
+    above. For non-US locations, only Wildfire and Heat are eligible —
+    generating "prepare your tornado safe room" advice from a score we've
+    already flagged as unvalidated would undercut the honesty built into
+    the hazard cards themselves.
+    """
+    eligible = []
+    for h in HAZARDS:
+        if h.get("us_only", False) and not is_us:
+            continue
+        score = scores[h["key"]]
+        level = get_threat_level(score)
+        tier = _LEVEL_TO_TIER.get(level["label"])
+        if tier:
+            eligible.append((h, score, level, tier))
+
+    eligible.sort(key=lambda x: x[1], reverse=True)
+
+    st_html("""
+    <div style="margin:20px 0 10px 0">
+        <span style="font-size:9px;color:#2e4156;font-family:'Rajdhani',sans-serif;
+            letter-spacing:3px">RECOMMENDATIONS</span>
+    </div>""")
+
+    if not eligible:
+        st_html("""
+        <div style="background:#07090f;border:1px solid #0e1929;border-radius:10px;
+            padding:16px 20px;display:flex;align-items:center;gap:10px">
+            <span style="font-size:18px">✅</span>
+            <span style="font-size:12px;color:#8fa0b0;font-family:'Inter',sans-serif">
+                No elevated risks detected right now — no specific action needed beyond
+                normal weather awareness.
+            </span>
+        </div>""")
+        return
+
+    for h, score, level, tier in eligible:
+        color = h["color"]
+        tips = RECOMMENDATIONS[h["key"]][tier]
+        tips_html = "".join(f"""
+        <div style="display:flex;align-items:flex-start;gap:8px;margin-top:6px">
+            <span style="color:{color};font-size:12px;line-height:1.5">▸</span>
+            <span style="font-size:11.5px;color:#c3ccd6;font-family:'Inter',sans-serif;
+                line-height:1.5">{tip}</span>
+        </div>""" for tip in tips)
+
+        st_html(f"""
+        <div style="background:#080e1c;border:1px solid {color}35;border-left:3px solid {color};
+            border-radius:8px;padding:14px 18px;margin-bottom:10px">
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:2px">
+                <span style="font-size:13px;font-family:'Rajdhani',sans-serif;font-weight:700;
+                    letter-spacing:1px;color:#dde4ee">{h['icon']} {h['label']}</span>
+                <span style="font-size:9px;font-family:'Rajdhani',sans-serif;font-weight:700;
+                    letter-spacing:1.5px;color:{level['color']};padding:2px 8px;border-radius:3px;
+                    background:{level['color']}18">{level['label']} · {score}/100</span>
+            </div>
+            {tips_html}
+        </div>""")
+
+
 def render_wx_strip(wx_row):
     items = [
         ("TEMP MAX",  f"{wx_row.get('temperature_2m_max', 0):.1f}°C"),
@@ -1065,6 +1211,9 @@ def main():
     for col, h in zip(cols2, row2):
         with col:
             render_hazard_card(h, scores[h["key"]], wx_row, is_us=city_info.get("is_us", False))
+
+    # ── Recommendations ───────────────────────────────────────────────────
+    render_recommendations(scores, is_us=city_info.get("is_us", False))
 
     # ── Surface conditions ────────────────────────────────────────────────
     render_wx_strip(wx_row)
